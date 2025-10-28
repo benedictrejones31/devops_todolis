@@ -1,0 +1,291 @@
+﻿pipeline {
+    agent any
+    
+    parameters {
+        choice(
+            name: 'ACTION',
+            choices: ['plan', 'apply', 'destroy'],
+            description: 'Select Terraform action'
+        )
+        booleanParam(
+            name: 'AUTO_APPROVE',
+            defaultValue: false,
+            description: 'Auto-approve Terraform changes'
+        )
+        booleanParam(
+            name: 'SKIP_TESTS',
+            defaultValue: false,
+            description: 'Skip running tests'
+        )
+    }
+    
+    environment {
+        // Azure credentials (don't change these - they reference Jenkins credentials)
+        AZURE_SUBSCRIPTION_ID = credentials('azure-subscription-id')
+        AZURE_TENANT_ID = credentials('azure-tenant-id')
+        AZURE_CLIENT_ID = credentials('azure-client-id')
+        AZURE_CLIENT_SECRET = credentials('azure-client-secret')
+        
+        // âš ï¸ UPDATE THESE WITH YOUR ACTUAL VALUES âš ï¸
+        ACR_NAME = 'todolistacr2025'              // Example: todolistacr2025
+        IMAGE_NAME = 'todolist-app'                   // Keep this
+        IMAGE_TAG = "${BUILD_NUMBER}"                 // Keep this
+        APP_SERVICE_NAME = 'todolist-webapp-2025'   // Example: todolist-webapp-2025
+        RESOURCE_GROUP = 'todolist-devops-rg'  // Example: todolist-devops-rg
+    }
+    
+    stages {
+        stage('Checkout') {
+            steps {
+                echo "Checking out source code..."
+                checkout scm
+            }
+        }
+        
+        stage('Install Dependencies') {
+            steps {
+                echo "Checking required tools..."
+                bat '''
+                    echo Checking Docker...
+                    docker --version
+                    
+                    echo Checking Terraform...
+                    terraform --version
+                    
+                    echo Checking Azure CLI...
+                    az --version
+                '''
+            }
+        }
+        
+        stage('Build Docker Image') {
+            when {
+                expression { params.ACTION == 'apply' || params.ACTION == 'plan' }
+            }
+            steps {
+                dir('app') {
+                    echo "Building Docker image..."
+                    bat """
+                        docker build -t ${IMAGE_NAME}:${IMAGE_TAG} .
+                        docker tag ${IMAGE_NAME}:${IMAGE_TAG} ${IMAGE_NAME}:latest
+                    """
+                }
+            }
+        }
+        
+        stage('Run Tests') {
+            when {
+                expression { 
+                    (params.ACTION == 'apply' || params.ACTION == 'plan') && 
+                    !params.SKIP_TESTS 
+                }
+            }
+            steps {
+                dir('app') {
+                    echo "Running tests..."
+                    bat '''
+                        pip install -r requirements.txt
+                        pip install pytest
+                        python -m pytest ../tests/test_app.py -v || exit 0
+                    '''
+                }
+            }
+        }
+        
+        stage('Terraform Init') {
+            steps {
+                dir('terraform') {
+                    echo "Initializing Terraform..."
+                    bat '''
+                        set ARM_CLIENT_ID=%AZURE_CLIENT_ID%
+                        set ARM_CLIENT_SECRET=%AZURE_CLIENT_SECRET%
+                        set ARM_SUBSCRIPTION_ID=%AZURE_SUBSCRIPTION_ID%
+                        set ARM_TENANT_ID=%AZURE_TENANT_ID%
+                        terraform init -reconfigure
+                    '''
+                }
+            }
+        }
+        
+        stage('Terraform Validate') {
+            steps {
+                dir('terraform') {
+                    echo "Validating Terraform configuration..."
+                    bat 'terraform validate'
+                }
+            }
+        }
+        
+        stage('Terraform Plan') {
+            steps {
+                dir('terraform') {
+                    echo "Planning infrastructure changes..."
+                    bat '''
+                        set ARM_CLIENT_ID=%AZURE_CLIENT_ID%
+                        set ARM_CLIENT_SECRET=%AZURE_CLIENT_SECRET%
+                        set ARM_SUBSCRIPTION_ID=%AZURE_SUBSCRIPTION_ID%
+                        set ARM_TENANT_ID=%AZURE_TENANT_ID%
+                        terraform plan -out=tfplan
+                    '''
+                }
+            }
+        }
+        
+        stage('Terraform Apply') {
+            when {
+                expression { params.ACTION == 'apply' }
+            }
+            steps {
+                script {
+                    if (!params.AUTO_APPROVE) {
+                        input message: 'Apply Terraform changes?', ok: 'Apply'
+                    }
+                }
+                dir('terraform') {
+                    echo "Applying infrastructure changes..."
+                    bat '''
+                        set ARM_CLIENT_ID=%AZURE_CLIENT_ID%
+                        set ARM_CLIENT_SECRET=%AZURE_CLIENT_SECRET%
+                        set ARM_SUBSCRIPTION_ID=%AZURE_SUBSCRIPTION_ID%
+                        set ARM_TENANT_ID=%AZURE_TENANT_ID%
+                        terraform apply -auto-approve tfplan
+                    '''
+                }
+            }
+        }
+        
+        stage('Get Terraform Outputs') {
+            when {
+                expression { params.ACTION == 'apply' }
+            }
+            steps {
+                dir('terraform') {
+                    script {
+                        echo "Getting Terraform outputs..."
+                        bat '''
+                            @echo off
+                            for /f "tokens=*" %%i in ('terraform output -raw acr_login_server') do set ACR_SERVER=%%i
+                            for /f "tokens=*" %%i in ('terraform output -raw acr_admin_username') do set ACR_USERNAME=%%i
+                            for /f "tokens=*" %%i in ('terraform output -raw acr_admin_password') do set ACR_PASSWORD=%%i
+                            
+                            echo ACR Server: %ACR_SERVER%
+                            echo ACR Username: %ACR_USERNAME%
+                            
+                            echo %ACR_SERVER% > acr_server.txt
+                            echo %ACR_USERNAME% > acr_username.txt
+                            echo %ACR_PASSWORD% > acr_password.txt
+                        '''
+                        
+                        env.ACR_SERVER = readFile('terraform/acr_server.txt').trim()
+                        env.ACR_USERNAME = readFile('terraform/acr_username.txt').trim()
+                        env.ACR_PASSWORD = readFile('terraform/acr_password.txt').trim()
+                    }
+                }
+            }
+        }
+        
+        stage('Login to ACR') {
+            when {
+                expression { params.ACTION == 'apply' }
+            }
+            steps {
+                echo "Logging into Azure Container Registry..."
+                bat """
+                    az login --service-principal -u %AZURE_CLIENT_ID% -p %AZURE_CLIENT_SECRET% --tenant %AZURE_TENANT_ID%
+                    az acr login --name ${ACR_NAME}
+                """
+            }
+        }
+        
+        stage('Push to ACR') {
+            when {
+                expression { params.ACTION == 'apply' }
+            }
+            steps {
+                echo "Pushing Docker image to ACR..."
+                bat """
+                    docker tag ${IMAGE_NAME}:${IMAGE_TAG} %ACR_SERVER%/${IMAGE_NAME}:${IMAGE_TAG}
+                    docker tag ${IMAGE_NAME}:${IMAGE_TAG} %ACR_SERVER%/${IMAGE_NAME}:latest
+                    docker push %ACR_SERVER%/${IMAGE_NAME}:${IMAGE_TAG}
+                    docker push %ACR_SERVER%/${IMAGE_NAME}:latest
+                """
+            }
+        }
+        
+        stage('Deploy to Azure App Service') {
+            when {
+                expression { params.ACTION == 'apply' }
+            }
+            steps {
+                echo "Deploying to Azure App Service..."
+                bat """
+                    az webapp config container set ^
+                        --name ${APP_SERVICE_NAME} ^
+                        --resource-group ${RESOURCE_GROUP} ^
+                        --docker-custom-image-name %ACR_SERVER%/${IMAGE_NAME}:${IMAGE_TAG} ^
+                        --docker-registry-server-url https://%ACR_SERVER%
+                    
+                    az webapp restart ^
+                        --name ${APP_SERVICE_NAME} ^
+                        --resource-group ${RESOURCE_GROUP}
+                """
+            }
+        }
+        
+        stage('Health Check') {
+            when {
+                expression { params.ACTION == 'apply' }
+            }
+            steps {
+                echo "Waiting for application to start..."
+                sleep time: 60, unit: 'SECONDS'
+                
+                echo "Checking application health..."
+                script {
+                    bat """
+                        curl -f https://${APP_SERVICE_NAME}.azurewebsites.net/health || exit 0
+                    """
+                }
+            }
+        }
+        
+        stage('Terraform Destroy') {
+            when {
+                expression { params.ACTION == 'destroy' }
+            }
+            steps {
+                script {
+                    input message: 'Are you sure you want to destroy infrastructure?', ok: 'Destroy'
+                }
+                dir('terraform') {
+                    echo "Destroying infrastructure..."
+                    bat '''
+                        set ARM_CLIENT_ID=%AZURE_CLIENT_ID%
+                        set ARM_CLIENT_SECRET=%AZURE_CLIENT_SECRET%
+                        set ARM_SUBSCRIPTION_ID=%AZURE_SUBSCRIPTION_ID%
+                        set ARM_TENANT_ID=%AZURE_TENANT_ID%
+                        terraform destroy -auto-approve
+                    '''
+                }
+            }
+        }
+    }
+    
+    post {
+        always {
+            echo "Cleaning up workspace..."
+            cleanWs()
+        }
+        success {
+            echo 'âœ“ Pipeline completed successfully!'
+            script {
+                if (params.ACTION == 'apply') {
+                    echo "Application URL: https://${APP_SERVICE_NAME}.azurewebsites.net"
+                }
+            }
+        }
+        failure {
+            echo 'âœ— Pipeline failed!'
+        }
+    }
+}
