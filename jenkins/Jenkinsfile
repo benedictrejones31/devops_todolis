@@ -1,4 +1,4 @@
-﻿pipeline {
+pipeline {
     agent any
     
     parameters {
@@ -20,18 +20,15 @@
     }
     
     environment {
-        // Azure credentials (don't change these - they reference Jenkins credentials)
         AZURE_SUBSCRIPTION_ID = credentials('azure-subscription-id')
         AZURE_TENANT_ID = credentials('azure-tenant-id')
         AZURE_CLIENT_ID = credentials('azure-client-id')
         AZURE_CLIENT_SECRET = credentials('azure-client-secret')
-        
-        // âš ï¸ UPDATE THESE WITH YOUR ACTUAL VALUES âš ï¸
-        ACR_NAME = 'todolistacr2025'              // Example: todolistacr2025
-        IMAGE_NAME = 'todolist-app'                   // Keep this
-        IMAGE_TAG = "${BUILD_NUMBER}"                 // Keep this
-        APP_SERVICE_NAME = 'todolist-webapp-2025'   // Example: todolist-webapp-2025
-        RESOURCE_GROUP = 'todolist-devops-rg'  // Example: todolist-devops-rg
+        ACR_NAME = 'todolistacr2025'
+        IMAGE_NAME = 'todolist-app'
+        IMAGE_TAG = "${BUILD_NUMBER}"
+        APP_SERVICE_NAME = 'todolist-webapp-2025'
+        RESOURCE_GROUP = 'todolist-devops-rg'
     }
     
     stages {
@@ -277,7 +274,7 @@
             cleanWs()
         }
         success {
-            echo 'âœ“ Pipeline completed successfully!'
+            echo '✓ Pipeline completed successfully!'
             script {
                 if (params.ACTION == 'apply') {
                     echo "Application URL: https://${APP_SERVICE_NAME}.azurewebsites.net"
@@ -285,7 +282,7 @@
             }
         }
         failure {
-            echo 'âœ— Pipeline failed!'
+            echo '✗ Pipeline failed!'
         }
     }
 }
